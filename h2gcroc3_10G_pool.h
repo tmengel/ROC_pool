@@ -2,11 +2,15 @@
 #define __H2GCROC3_10G_POOL_H__
 
 #include "ROC_pool.h"
+#include <map>
 
 // Pool for packet format 302 (IDH2GCROC3_10G), same API as
 // oncsSub_idh2gcroc3_10G. A "sample" holds the values of all channels
 // for one timestamp; a waveform is a run of samples less than
-// CONTIGUOUS_CLOCK apart.
+// CONTIGUOUS_CLOCK apart. The lines of neighbouring samples can arrive
+// interleaved (a link runs a sample ahead now and then), so samples are
+// kept open, keyed by timestamp, until the stream is REORDER_WINDOW clocks
+// past them, and closed in timestamp order.
 //
 // "NR_WF" is the number of complete waveforms on offer, wf = 0 .. NR_WF-1.
 // The sample-indexed calls ("SAMPLES", "TIMESTAMP", "CMN", "CALIB",
@@ -29,6 +33,8 @@ public:
 
   static const unsigned int MAX_CHIPS = 4;
   static const uint64_t CONTIGUOUS_CLOCK = 164;
+  static const uint64_t REORDER_WINDOW = 4*CONTIGUOUS_CLOCK;  // a sample stays open this long behind the newest timestamp
+  static const uint64_t RESET_CLOCK = 100000000;              // a timestamp this far back is a counter reset
 
 protected:
 
@@ -39,7 +45,6 @@ protected:
   bool has_pending() const;
 
   int decode_line(const uint8_t *d);
-  void close_sample();
 
   static unsigned int u4frombyte(const uint8_t *v);
   static uint64_t u8frombyte(const uint8_t *v);
@@ -58,6 +63,9 @@ protected:
     unsigned int calib;
     unsigned int crc32;
   };
+
+  void close_sample(const sample &s);           // append a closed sample to the waveforms
+  void close_samples(const uint64_t before);    // close the open samples below this timestamp, in order
 
   // samples are numbered from the start of the stream; _samples[0] is
   // sample number _sample_base
@@ -78,9 +86,9 @@ protected:
   wf_bounds _open_wf;
   uint64_t _last_closed_ts;
 
-  sample _open_sample;              // the one being filled
-  bool _have_open_sample;
-  uint64_t _old_timestamp;
+  std::map<uint64_t, sample> _open; // samples still receiving lines, by timestamp
+  uint64_t _max_timestamp;
+  uint64_t _closed_before;          // samples below this are closed; a line for one is late
 
   unsigned int _nr_offered;
   unsigned long long _nr_offered_samples;

@@ -14,9 +14,8 @@ h2gcroc3_10G_pool::h2gcroc3_10G_pool(const unsigned int low_mark, const unsigned
   _open_wf.first = 0;
   _open_wf.length = 0;
   _last_closed_ts = 0;
-  memset(&_open_sample, 0, sizeof(sample));
-  _have_open_sample = false;
-  _old_timestamp = 0;
+  _max_timestamp = 0;
+  _closed_before = 0;
   _nr_offered = 0;
   _nr_offered_samples = 0;
   _nr_channels = 0;
@@ -84,61 +83,78 @@ int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
 
   if ( (int) (ichip+1) * 72 > _nr_channels) _nr_channels = (ichip+1) * 72;
 
-  if ( !_have_open_sample)
+  // a timestamp far behind everything seen so far is a counter reset: close what we have first
+  if ( _max_timestamp > RESET_CLOCK && timestamp + RESET_CLOCK < _max_timestamp)
     {
-      memset(&_open_sample, 0, sizeof(sample));
-      _open_sample.timestamp = timestamp;
-      _old_timestamp = timestamp;
-      _have_open_sample = true;
+      close_samples( 0xffffffffffffffffULL);
+      _closed_before = 0;
+      _max_timestamp = 0;
     }
+  if ( timestamp > _max_timestamp) _max_timestamp = timestamp;
 
-  // the timestamp moved on - that sample is done
-  if ( ( timestamp >= _old_timestamp && timestamp - _old_timestamp > 5 ) ||
-       ( timestamp <  _old_timestamp && _old_timestamp - timestamp > 5 ) )
+  // this line's sample is already closed - it arrived too late to be used
+  if ( timestamp < _closed_before) return 0;
+
+  // the lines of a sample arrive within 5 clocks of each other, but the links can run a
+  // sample ahead of each other, so lines of neighbouring samples interleave. Find the open
+  // sample this line belongs to, or open one.
+  std::map<uint64_t, sample>::iterator it = _open.lower_bound( timestamp > 5 ? timestamp - 5 : 0);
+  if ( it == _open.end() || it->first > timestamp + 5)
     {
-      close_sample();
-      memset(&_open_sample, 0, sizeof(sample));
-      _open_sample.timestamp = timestamp;
-      _have_open_sample = true;
+      it = _open.emplace(timestamp, sample()).first;
+      memset(&it->second, 0, sizeof(sample));
+      it->second.timestamp = timestamp;
     }
-  _old_timestamp = timestamp;
+  sample &s = it->second;
 
   int chip_offset = ichip * 72;
   int group_offset = group ? 36 : 0;
 
   for ( int c = 0; c < 36; c++)
     {
-      _open_sample.ADC[chip_offset + group_offset + c] = (ch[c] >> 20) & 0x3ff;
-      _open_sample.tot[chip_offset + group_offset + c] = (ch[c] >> 10) & 0x3ff;
-      _open_sample.toa[chip_offset + group_offset + c] =  ch[c]        & 0x3ff;
+      s.ADC[chip_offset + group_offset + c] = (ch[c] >> 20) & 0x3ff;
+      s.tot[chip_offset + group_offset + c] = (ch[c] >> 10) & 0x3ff;
+      s.toa[chip_offset + group_offset + c] =  ch[c]        & 0x3ff;
     }
 
   // the ROC header is 0101 + 12b Bx + 6b Event + 3b Orbit + H1 H2 H3 + 0101
   // (H2GCROC3 datasheet p. 30); H1 = error in the header, H2 in CM and
   // channels 0-17, H3 in Calib and channels 18-35 of this half-chip
-  _open_sample.error[(chip_offset + group_offset) / 36] = (ROC_HDR >> 4) & 0x7;
+  s.error[(chip_offset + group_offset) / 36] = (ROC_HDR >> 4) & 0x7;
 
-  _open_sample.trigger_in    = trigger_in;
-  _open_sample.trigger_out   = trigger_out;
-  _open_sample.event_counter = evt_ctr;
-  _open_sample.cmn           = CMN;
-  _open_sample.calib         = CALIB;
-  _open_sample.crc32         = CRC;
+  s.trigger_in    = trigger_in;
+  s.trigger_out   = trigger_out;
+  s.event_counter = evt_ctr;
+  s.cmn           = CMN;
+  s.calib         = CALIB;
+  s.crc32         = CRC;
+
+  // samples far enough behind the newest timestamp cannot receive lines anymore
+  if ( _max_timestamp > REORDER_WINDOW) close_samples( _max_timestamp - REORDER_WINDOW);
 
   return 0;
 }
 
-// the open sample is complete; append it to the open waveform, or close
-// that and start a new one (same rule as oncsSub_idh2gcroc3_10G::parse_timeline())
-void h2gcroc3_10G_pool::close_sample()
+// close the open samples below "before", oldest first
+void h2gcroc3_10G_pool::close_samples(const uint64_t before)
 {
-  if ( !_have_open_sample) return;
+  std::map<uint64_t, sample>::iterator it = _open.begin();
+  while ( it != _open.end() && it->first < before)
+    {
+      close_sample(it->second);
+      it = _open.erase(it);
+    }
+  if ( before > _closed_before) _closed_before = before;
+}
 
+// a closed sample: append it to the open waveform, or close that and
+// start a new one (same rule as oncsSub_idh2gcroc3_10G::parse_timeline())
+void h2gcroc3_10G_pool::close_sample(const sample &closed)
+{
   const unsigned long long number = _sample_base + _samples.size();
-  const uint64_t ts = _open_sample.timestamp;
+  const uint64_t ts = closed.timestamp;
 
-  _samples.push_back(_open_sample);
-  _have_open_sample = false;
+  _samples.push_back(closed);
 
   if ( _have_open_wf && ts - _last_closed_ts > CONTIGUOUS_CLOCK)
     {
@@ -158,7 +174,7 @@ void h2gcroc3_10G_pool::close_sample()
 
 void h2gcroc3_10G_pool::close_open()
 {
-  close_sample();
+  close_samples( 0xffffffffffffffffULL);
   if ( _have_open_wf)
     {
       _waveforms.push_back(_open_wf);
@@ -198,7 +214,7 @@ void h2gcroc3_10G_pool::drop_offer()
 
 bool h2gcroc3_10G_pool::has_pending() const
 {
-  return ( _have_open_sample || _have_open_wf || !_waveforms.empty() );
+  return ( !_open.empty() || _have_open_wf || !_waveforms.empty() );
 }
 
 const h2gcroc3_10G_pool::sample *h2gcroc3_10G_pool::getSample(const int wf, const int s) const
