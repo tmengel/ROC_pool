@@ -36,6 +36,13 @@ public:
   static const uint64_t REORDER_WINDOW = 4*CONTIGUOUS_CLOCK;  // a sample stays open this long behind the newest timestamp
   static const uint64_t RESET_CLOCK = 100000000;              // a timestamp this far back is a counter reset
 
+  // problems counted over the whole stream (the per-Packet decoder counts per Packet)
+  unsigned long long crc_errors() const { return _crc_errors; }
+  unsigned long long hamming_errors() const { return _hamming_errors; }
+  unsigned long long bad_lines() const { return _bad_lines; }
+  unsigned long long late_lines() const { return _late_lines; }
+  unsigned long long resets() const { return _resets; }
+
 protected:
 
   int decode_datagram(const uint32_t *d, const unsigned int nbytes);
@@ -48,6 +55,7 @@ protected:
 
   static unsigned int u4frombyte(const uint8_t *v);
   static uint64_t u8frombyte(const uint8_t *v);
+  static unsigned int crc32_frame(const uint8_t *d, const int n);
 
   struct sample
   {
@@ -62,6 +70,7 @@ protected:
     unsigned int cmn;
     unsigned int calib;
     unsigned int crc32;
+    unsigned int crc_error[2*MAX_CHIPS];   // per link (2*chip + group): 1 if the line's CRC-32 did not match
   };
 
   void close_sample(const sample &s);           // append a closed sample to the waveforms
@@ -89,6 +98,12 @@ protected:
   std::map<uint64_t, sample> _open; // samples still receiving lines, by timestamp
   uint64_t _max_timestamp;
   uint64_t _closed_before;          // samples below this are closed; a line for one is late
+
+  unsigned long long _crc_errors;
+  unsigned long long _hamming_errors;
+  unsigned long long _bad_lines;    // no line marker, or chip / half out of range
+  unsigned long long _late_lines;   // arrived after their sample was closed (dropped)
+  unsigned long long _resets;
 
   unsigned int _nr_offered;
   unsigned long long _nr_offered_samples;

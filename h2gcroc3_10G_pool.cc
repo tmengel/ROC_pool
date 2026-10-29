@@ -16,6 +16,11 @@ h2gcroc3_10G_pool::h2gcroc3_10G_pool(const unsigned int low_mark, const unsigned
   _last_closed_ts = 0;
   _max_timestamp = 0;
   _closed_before = 0;
+  _crc_errors = 0;
+  _hamming_errors = 0;
+  _bad_lines = 0;
+  _late_lines = 0;
+  _resets = 0;
   _nr_offered = 0;
   _nr_offered_samples = 0;
   _nr_channels = 0;
@@ -36,6 +41,36 @@ uint64_t h2gcroc3_10G_pool::u8frombyte(const uint8_t *v)
   return r;
 }
 
+// CRC-32 of the DAQ frame as the ASIC computes it (H2GCROC3 datasheet 1.3.1): polynomial
+// 0x04C11DB7, initial value 0, no bit reflection, no final xor, MSB first
+// (same as oncsSub_idh2gcroc3_10G::crc32_frame)
+unsigned int h2gcroc3_10G_pool::crc32_frame(const uint8_t *d, const int n)
+{
+  static uint32_t table[256];
+  static bool table_done = false;
+
+  if ( !table_done)
+    {
+      for ( uint32_t i = 0; i < 256; i++)
+	{
+	  uint32_t c = i << 24;
+	  for ( int k = 0; k < 8; k++)
+	    {
+	      c = ( c & 0x80000000u) ? ( c << 1) ^ 0x04C11DB7u : ( c << 1);
+	    }
+	  table[i] = c;
+	}
+      table_done = true;
+    }
+
+  uint32_t crc = 0;
+  for ( int i = 0; i < n; i++)
+    {
+      crc = ( crc << 8) ^ table[ ( ( crc >> 24) ^ d[i]) & 0xff];
+    }
+  return crc;
+}
+
 // one datagram, starting after the marker/length: 14 header bytes, then
 // 192-byte lines, the last 4 bytes are not part of any line (same
 // boundaries as oncsSub_idh2gcroc3_10G::decode())
@@ -54,7 +89,11 @@ int h2gcroc3_10G_pool::decode_datagram(const uint32_t *d, const unsigned int nby
 // same as oncsSub_idh2gcroc3_10G::decode_line()
 int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
 {
-  if ( d[0] != 0xaa || d[1] != 0x5a) return 0;
+  if ( d[0] != 0xaa || d[1] != 0x5a)
+    {
+      _bad_lines++;
+      return 0;
+    }
 
   unsigned int ichip = d[2] & 0xf;
   int group = d[3] - 36;
@@ -79,7 +118,15 @@ int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
     }
   uint32_t CRC = u4frombyte(&d[188]);
 
-  if ( ichip >= MAX_CHIPS || ( group != 0 && group != 1) ) return 0;
+  if ( ichip >= MAX_CHIPS || ( group != 0 && group != 1) )
+    {
+      _bad_lines++;
+      return 0;
+    }
+
+  // frame integrity (H2GCROC3 datasheet 1.3.1): CRC-32 over the 39 words header..ch35
+  const int link = 2*ichip + group;
+  const unsigned int crc_error = ( crc32_frame(&d[32], 156) != CRC ) ? 1 : 0;
 
   if ( (int) (ichip+1) * 72 > _nr_channels) _nr_channels = (ichip+1) * 72;
 
@@ -89,11 +136,16 @@ int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
       close_samples( 0xffffffffffffffffULL);
       _closed_before = 0;
       _max_timestamp = 0;
+      _resets++;
     }
   if ( timestamp > _max_timestamp) _max_timestamp = timestamp;
 
   // this line's sample is already closed - it arrived too late to be used
-  if ( timestamp < _closed_before) return 0;
+  if ( timestamp < _closed_before)
+    {
+      _late_lines++;
+      return 0;
+    }
 
   // the lines of a sample arrive within 5 clocks of each other, but the links can run a
   // sample ahead of each other, so lines of neighbouring samples interleave. Find the open
@@ -128,6 +180,9 @@ int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
   s.cmn           = CMN;
   s.calib         = CALIB;
   s.crc32         = CRC;
+  s.crc_error[link] = crc_error;
+  if ( crc_error) _crc_errors++;
+  if ( s.error[link]) _hamming_errors++;
 
   // samples far enough behind the newest timestamp cannot receive lines anymore
   if ( _max_timestamp > REORDER_WINDOW) close_samples( _max_timestamp - REORDER_WINDOW);
@@ -258,6 +313,14 @@ int h2gcroc3_10G_pool::iValue(const int n, const char *what)
       return _waveforms[n].length;
     }
 
+  // problem counts, cumulative over the stream
+  if ( strcmp(what, "CRCERRORS") == 0)     return (int) _crc_errors;
+  if ( strcmp(what, "HAMMINGERRORS") == 0) return (int) _hamming_errors;
+  if ( strcmp(what, "BADLINES") == 0)      return (int) _bad_lines;
+  if ( strcmp(what, "LATELINES") == 0)     return (int) _late_lines;
+  if ( strcmp(what, "RESETS") == 0)        return (int) _resets;
+  if ( strcmp(what, "DECODEERRORS") == 0)  return (int) (_bad_lines + _late_lines + _resets);
+
   const sample *s = getSample(n);
   if ( !s) return 0;
 
@@ -311,6 +374,7 @@ int h2gcroc3_10G_pool::iValue(const int wf, const int sample, const int ch, cons
   if ( strcmp(what, "TRIGGER_IN") == 0)    return s->trigger_in;
   if ( strcmp(what, "TRIGGER_OUT") == 0)   return s->trigger_out;
   if ( strcmp(what, "EVENT_COUNTER") == 0) return s->event_counter;
+  if ( strcmp(what, "CRCERROR") == 0)      return s->crc_error[ 2*(ch/72) + (ch%72)/36 ];
   return 0;
 }
 
