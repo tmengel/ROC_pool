@@ -55,7 +55,7 @@ int h2gcroc3_10G_pool::decode_datagram(const uint32_t *d, const unsigned int nby
 // same as oncsSub_idh2gcroc3_10G::decode_line()
 int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
 {
-  if ( d[0] != 0xaa && d[1] != 0x5a) return 0;
+  if ( d[0] != 0xaa || d[1] != 0x5a) return 0;
 
   unsigned int ichip = d[2] & 0xf;
   int group = d[3] - 36;
@@ -80,7 +80,7 @@ int h2gcroc3_10G_pool::decode_line(const uint8_t *d)
     }
   uint32_t CRC = u4frombyte(&d[188]);
 
-  if ( ichip >= MAX_CHIPS) return 0;
+  if ( ichip >= MAX_CHIPS || ( group != 0 && group != 1) ) return 0;
 
   if ( (int) (ichip+1) * 72 > _nr_channels) _nr_channels = (ichip+1) * 72;
 
